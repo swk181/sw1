@@ -1,7 +1,9 @@
 import os
+import json
+import asyncio
 import requests
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 
 app = FastAPI(title="WoS & Elsevier MCP Server")
 
@@ -11,31 +13,51 @@ API_KEY = os.getenv("WOS_API_KEY", "")
 def home():
     return {"status": "MCP Server Active"}
 
-# 1. ChatGPT MCP 핸드셰이크 및 통신 엔드포인트 (POST /mcp)
-@app.post("/mcp")
-async def handle_mcp(request: Request):
+# 1. ChatGPT가 MCP 규격 확인용으로 호출하는 SSE 연결 헤더 엔드포인트
+@app.get("/mcp")
+async def mcp_sse_endpoint(request: Request):
+    async def event_generator():
+        # ChatGPT에게 정상 MCP SSE 연결임을 알리는 endpoint 이벤트 전송
+        endpoint_event = {
+            "event": "endpoint",
+            "data": "/mcp/messages"
+        }
+        yield f"event: endpoint\ndata: /mcp/messages\n\n"
+        
+        while True:
+            if await request.is_disconnected():
+                break
+            await asyncio.sleep(15)
+            yield ": keepalive\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+        }
+    )
+
+# 2. ChatGPT 메시지 수신 및 도구 호출 처리 엔드포인트 (/mcp/messages)
+@app.post("/mcp/messages")
+async def handle_mcp_messages(request: Request):
     body = await request.json()
     method = body.get("method")
     msg_id = body.get("id", 1)
 
-    # ChatGPT의 초기 연결 검증 (Initialize)
     if method == "initialize":
         return JSONResponse({
             "jsonrpc": "2.0",
             "id": msg_id,
             "result": {
                 "protocolVersion": "2024-11-05",
-                "capabilities": {
-                    "tools": {}
-                },
-                "serverInfo": {
-                    "name": "wos-elsevier-search",
-                    "version": "1.0.0"
-                }
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "wos-elsevier-search", "version": "1.0.0"}
             }
         })
 
-    # 사용 가능한 도구 목록 제공 (tools/list)
     elif method == "tools/list":
         return JSONResponse({
             "jsonrpc": "2.0",
@@ -65,7 +87,6 @@ async def handle_mcp(request: Request):
             }
         })
 
-    # 실제 논문 검색 실행 (tools/call)
     elif method == "tools/call":
         params = body.get("params", {})
         tool_name = params.get("name")
@@ -90,18 +111,8 @@ async def handle_mcp(request: Request):
                 "jsonrpc": "2.0",
                 "id": msg_id,
                 "result": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": result_text
-                        }
-                    ]
+                    "content": [{"type": "text", "text": result_text}]
                 }
             })
 
-    # 기타 통지(Notification) 처리
     return JSONResponse({"jsonrpc": "2.0", "id": msg_id, "result": {}})
-
-@app.get("/mcp")
-async def handle_mcp_get():
-    return {"status": "MCP Endpoint Ready. Use POST for MCP JSON-RPC requests."}
